@@ -1,5 +1,7 @@
 # port-sentinel
 
+![port-sentinel](docs/social-preview.png)
+
 **Know every port your server listens on. Get told when that changes.**
 
 `port-sentinel` checks every listening socket on a Linux server against a short allowlist you keep next to it: which ports, which program, how far the bind address reaches. Anything else is a problem, and it can alert Discord, Slack, Telegram, ntfy or any webhook the moment it appears, and again when it is gone.
