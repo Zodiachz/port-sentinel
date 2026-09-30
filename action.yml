@@ -1,0 +1,47 @@
+name: port-sentinel probe
+description: Scan your server from the internet and fail when a port answers that your allowlist does not expect.
+author: Zodiachz
+branding:
+  icon: shield
+  color: red
+
+inputs:
+  host:
+    description: Host name or IP address of a server you own.
+    required: true
+  allowlist:
+    description: Allowlist file in your repository. Without one the action only lists open ports.
+    required: false
+    default: ""
+  ports:
+    description: Ports to try, like 1-1024,8080.
+    required: false
+    default: "1-65535"
+  timeout:
+    description: Seconds to wait for each port.
+    required: false
+    default: "1"
+  workers:
+    description: Parallel connections.
+    required: false
+    default: "128"
+  notify:
+    description: Webhook URL(s) or exec:COMMAND to alert (pass it from a secret). Space separated.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PS_HOST: ${{ inputs.host }}
+        PS_ALLOW: ${{ inputs.allowlist }}
+        PS_PORTS: ${{ inputs.ports }}
+        PS_TIMEOUT: ${{ inputs.timeout }}
+        PS_WORKERS: ${{ inputs.workers }}
+        PORT_SENTINEL_NOTIFY: ${{ inputs.notify }}
+      run: |
+        args=(probe "$PS_HOST" --ports "$PS_PORTS" --timeout "$PS_TIMEOUT" --workers "$PS_WORKERS")
+        if [ -n "$PS_ALLOW" ]; then args+=(--allow "$PS_ALLOW"); fi
+        python3 "$GITHUB_ACTION_PATH/port-sentinel" "${args[@]}"

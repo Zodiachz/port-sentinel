@@ -1,0 +1,19 @@
+# Put this in .github/workflows/ of a PRIVATE repository that also holds your allowlist.
+# Every hour a GitHub runner scans your server from the internet: the job fails, and alerts,
+# when a port answers that the allowlist does not expect, or a required one stops answering.
+name: external port probe
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Zodiachz/port-sentinel@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          allowlist: servers/web1.conf
+          notify: ${{ secrets.DISCORD_WEBHOOK }}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run port-sentinel every 5 minutes
+Documentation=https://github.com/Zodiachz/port-sentinel
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

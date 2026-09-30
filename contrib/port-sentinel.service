@@ -1,0 +1,23 @@
+# One check, run by port-sentinel.timer. Alerts go to the targets in /etc/port-sentinel/env:
+#   PORT_SENTINEL_NOTIFY=https://discord.com/api/webhooks/...
+# The unit ends "failed" while a problem is open, so `systemctl --failed` shows it too.
+[Unit]
+Description=port-sentinel: check listening ports against the allowlist
+Documentation=https://github.com/Zodiachz/port-sentinel
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/port-sentinel/env
+ExecStart=/usr/local/bin/port-sentinel check --quiet --state /var/lib/port-sentinel/state.json
+StateDirectory=port-sentinel
+
+# root is needed to see which program owns each socket; keep only what that takes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

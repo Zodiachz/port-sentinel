@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""port-sentinel: know every port your server listens on, and get told when that changes.
+
+Reads the kernel socket tables (/proc/net) and checks every listening port against a short
+allowlist kept on the server: which ports, which program, how exposed. Anything else is a
+problem: a new service bound to 0.0.0.0, a database that left localhost, a port that came back
+after you closed it, a required service that stopped listening.
+
+    port-sentinel scan             list listening ports (with their status if an allowlist exists)
+    port-sentinel init             write an allowlist from what listens right now
+    port-sentinel check            exit 1 on any problem; --notify to alert, --state for cron
+    port-sentinel watch            the same, in a loop
+    port-sentinel probe HOST       TCP connect scan from outside: what is really reachable
+
+Stdlib only, Python 3.8+. scan/init/check/watch read Linux /proc; probe runs anywhere.
+https://github.com/Zodiachz/port-sentinel
+"""
+import argparse
+import datetime
+import fnmatch
+import ipaddress
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+__version__ = "1.0.0"
+
+SCOPES = ("loopback", "private", "public")
+LEVEL = {name: i for i, name in enumerate(SCOPES)}
+PROC_TABLES = (("tcp", "tcp"), ("tcp6", "tcp"), ("udp", "udp"), ("udp6", "udp"))
+TCP_LISTEN = "0A"
+UDP_UNCONNECTED = "07"
+DEFAULT_ALLOW = "/etc/port-sentinel/allow.conf"
+LOCAL_ALLOW = "port-sentinel.conf"
+ENV_ALLOW = "PORT_SENTINEL_ALLOW"
+ENV_NOTIFY = "PORT_SENTINEL_NOTIFY"
+DISCORD_LIMIT = 2000
+
+
+class Error(Exception):
+    """A problem worth one line on stderr and exit code 2."""
+
+
+# ------------------------------------------------------------------------------ kernel tables
+def decode_address(field):
+    """'0100007F:1F90' -> ('127.0.0.1', 8080). /proc prints addresses in host byte order."""
+    hexip, hexport = field.split(":")
+    packed = b"".join(struct.pack("=I", int(hexip[i:i + 8], 16)) for i in range(0, len(hexip), 8))
+    addr = ipaddress.ip_address(packed)
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return str(addr), int(hexport, 16)
+
+
+def parse_table(text, proto):
+    """Rows of one /proc/net/{tcp,tcp6,udp,udp6} file: [(proto, ip, port, inode)].
+
+    TCP: sockets in LISTEN. UDP: bound sockets with no peer (state 07), i.e. anything that can
+    receive a datagram from anyone."""
+    want = TCP_LISTEN if proto == "tcp" else UDP_UNCONNECTED
+    rows = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 10 or f[3] != want:
+            continue
+        ip, port = decode_address(f[1])
+        if port:
+            rows.append((proto, ip, port, int(f[9])))
+    return rows
+
+
+def read_sockets(proc):
+    rows = []
+    for name, proto in PROC_TABLES:
+        try:
+            with open(os.path.join(proc, "net", name)) as f:
+                rows.extend(parse_table(f.read(), proto))
+        except FileNotFoundError:
+            continue  # IPv6 disabled, for example
+    return rows
+
+
+def process_info(proc, pid):
+    def read(name):
+        try:
+            with open(os.path.join(proc, pid, name), "rb") as f:
+                return f.read()
+        except OSError:
+            return b""
+    try:
+        exe = os.path.basename(os.readlink(os.path.join(proc, pid, "exe")))
+    except OSError:
+        exe = ""
+    if exe.endswith(" (deleted)"):
+        exe = exe[:-10]
+    comm = read("comm").decode("utf-8", "replace").strip()
+    # comm is cut at 15 characters and rewritten by process.title (pm2: "node /opt/app/..."),
+    # so fall back to the executable name when it looks like either
+    name = comm if comm and " " not in comm and len(comm) < 15 else (exe or comm.split(" ")[0])
+    return {
+        "pid": int(pid),
+        "name": name,
+        "comm": comm,
+        "exe": exe,
+        "cmd": " ".join(read("cmdline").replace(b"\0", b" ").decode("utf-8", "replace").split()),
+    }
+
+
+INTERPRETERS = ("node", "nodejs", "bun", "deno", "php", "ruby", "perl")
+SCRIPT_RE = re.compile(r"^(.+?\.(?:js|mjs|cjs|ts|py|php|rb|pl))(?: |$)")
+
+
+def script_of(process):
+    """The script an interpreter runs ('node /srv/app/index.js' -> '/srv/app/index.js'), or None."""
+    name = process["name"]
+    if name not in INTERPRETERS and not re.match(r"python[0-9.]*$", name):
+        return None
+    words = process["cmd"].split(" ")[1:]
+    while words and words[0].startswith("-"):
+        words.pop(0)
+    rest = " ".join(words)
+    m = SCRIPT_RE.match(rest)
+    script = m.group(1) if m else (words[0] if words else "")
+    return script or None
+
+
+def cmd_glob(script):
+    """A cmd= glob that fits in one allowlist token: spaces become ?, brackets are escaped."""
+    return "*" + script.replace("[", "[[]").replace(" ", "?").replace("#", "?") + "*"
+
+
+def read_owners(proc, inodes):
+    """socket inode -> {pid: process info}, for the processes we are allowed to look into."""
+    owners, seen = {}, {}
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        fd_dir = os.path.join(proc, pid, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue  # gone, or not ours to read
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if not target.startswith("socket:["):
+                continue
+            inode = int(target[8:-1])
+            if inode in inodes:
+                if pid not in seen:
+                    seen[pid] = process_info(proc, pid)
+                owners.setdefault(inode, {})[seen[pid]["pid"]] = seen[pid]
+    return owners
+
+
+def exposure(ip):
+    """How far a bind address reaches: loopback < private < public (0.0.0.0 and :: are public)."""
+    addr = ipaddress.ip_address(ip)
+    if addr.is_unspecified:
+        return "public"
+    if addr.is_loopback:
+        return "loopback"
+    return "public" if addr.is_global else "private"
+
+
+def collect(proc="/proc"):
+    """Every listening socket, grouped by (proto, address, port), with the programs holding it."""
+    if not os.path.isfile(os.path.join(proc, "net", "tcp")):
+        raise Error("%s/net/tcp not found: scan, init, check and watch read the Linux socket "
+                    "tables (probe works anywhere)" % proc)
+    rows = read_sockets(proc)
+    owners = read_owners(proc, {r[3] for r in rows})
+    grouped = {}
+    for proto, ip, port, inode in rows:
+        entry = grouped.setdefault((proto, ip, port), {
+            "proto": proto, "address": ip, "port": port, "exposure": exposure(ip), "processes": {}})
+        entry["processes"].update(owners.get(inode, {}))
+    listeners = []
+    for entry in grouped.values():
+        entry["processes"] = sorted(entry["processes"].values(), key=lambda p: p["pid"])
+        listeners.append(entry)
+    listeners.sort(key=lambda l: (l["proto"], l["port"], ":" in l["address"], l["address"]))
+    return listeners
+
+
+def is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def ephemeral_range(proc):
+    try:
+        with open(os.path.join(proc, "sys", "net", "ipv4", "ip_local_port_range")) as f:
+            lo, hi = f.read().split()
+        return int(lo), int(hi)
+    except (OSError, ValueError):
+        return 32768, 60999
+
+
+# ---------------------------------------------------------------------------------- allowlist
+class Rule:
+    def __init__(self, proto, ports, process="*", scope="public", required=False, cmd=None,
+                 line=0, text=""):
+        self.proto, self.ports, self.process, self.scope = proto, ports, process, scope
+        self.required, self.cmd, self.line, self.text = required, cmd, line, text
+
+    def covers(self, proto, port):
+        if self.proto != "any" and self.proto != proto:
+            return False
+        return self.ports is None or any(lo <= port <= hi for lo, hi in self.ports)
+
+    def owns(self, processes):
+        """True when every program on the socket fits this rule. Unknown owner: only '*' does."""
+        if self.process == "*" and self.cmd is None:
+            return True
+        if not processes:
+            return False
+        for p in processes:
+            if self.process != "*" and not any(n and fnmatch.fnmatchcase(n, self.process)
+                                               for n in (p["name"], p.get("comm"), p["exe"])):
+                return False
+            if self.cmd is not None and not fnmatch.fnmatchcase(p["cmd"], self.cmd):
+                return False
+        return True
+
+    def label(self):
+        who = "" if self.process == "*" else " " + self.process
+        return "%s %s%s" % (self.proto, format_ranges(self.ports), who)
+
+
+def parse_ports(spec):
+    """'22', '80,443', '8000-8099', '*' -> ((lo, hi), ...) or None for any port."""
+    if spec in ("*", "any"):
+        return None
+    ranges = []
+    for part in spec.split(","):
+        lo, dash, hi = part.partition("-")
+        try:
+            lo = int(lo)
+            hi = int(hi) if dash else lo
+        except ValueError:
+            raise ValueError("bad port %r" % part)
+        if not 1 <= lo <= hi <= 65535:
+            raise ValueError("port out of range: %r" % part)
+        ranges.append((lo, hi))
+    return tuple(ranges)
+
+
+def format_ranges(ranges):
+    if ranges is None:
+        return "*"
+    return ",".join(str(lo) if lo == hi else "%d-%d" % (lo, hi) for lo, hi in ranges)
+
+
+def compress(ports):
+    ranges = []
+    for p in sorted(set(ports)):
+        if ranges and p == ranges[-1][1] + 1:
+            ranges[-1][1] = p
+        else:
+            ranges.append([p, p])
+    return tuple((lo, hi) for lo, hi in ranges)
+
+
+def parse_allowlist(text, source="allowlist"):
+    rules = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        tok = line.split()
+        where = "%s:%d" % (source, n)
+        if len(tok) < 2:
+            raise Error("%s: expected PROTO PORTS [PROCESS] [OPTIONS], got %r" % (where, line))
+        proto = tok[0].lower()
+        if proto not in ("tcp", "udp", "any"):
+            raise Error("%s: protocol must be tcp, udp or any, got %r" % (where, tok[0]))
+        try:
+            ports = parse_ports(tok[1])
+        except ValueError as e:
+            raise Error("%s: %s" % (where, e))
+        process, scope, required, cmd = None, "public", False, None
+        for t in tok[2:]:
+            low = t.lower()
+            if low in LEVEL:
+                scope = low
+            elif low == "required":
+                required = True
+            elif low.startswith("cmd="):
+                cmd = t[4:]
+            elif process is None:
+                process = t
+            else:
+                raise Error("%s: unexpected %r (one program per line; options: loopback, private, "
+                            "public, required, cmd=GLOB)" % (where, t))
+        rules.append(Rule(proto, ports, process or "*", scope, required, cmd, n, line))
+    return rules
+
+
+def find_allowlist(path, must_exist=True):
+    path = path or os.environ.get(ENV_ALLOW)
+    if not path:
+        for candidate in (DEFAULT_ALLOW, LOCAL_ALLOW):
+            if os.path.isfile(candidate):
+                path = candidate
+                break
+    if must_exist and (not path or not os.path.isfile(path)):
+        raise Error("no allowlist%s: run `port-sentinel init` first, or pass --allow FILE"
+                    % (" at " + path if path else ""))
+    return path
+
+
+def load_rules(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return parse_allowlist(f.read(), path)
+    except OSError as e:
+        raise Error("cannot read %s: %s" % (path, e.strerror))
+
+
+# --------------------------------------------------------------------------------- evaluation
+def names(processes):
+    return ",".join(sorted({p["name"] or p["exe"] or "?" for p in processes})) or "?"
+
+
+def program(processes):
+    """names() plus the script for interpreters, for display."""
+    scripts = sorted({s for s in map(script_of, processes) if s})
+    return names(processes) + (" " + scripts[0] if len(scripts) == 1 else "")
+
+
+def endpoint(address, port):
+    return ("[%s]:%d" if ":" in address else "%s:%d") % (address, port)
+
+
+def problem(kind, proto, address, port, process, message, exposure_="public"):
+    return {"kind": kind, "proto": proto, "address": address, "port": port, "process": process,
+            "exposure": exposure_, "message": message,
+            "key": "%s %s %s %s" % (kind, proto, endpoint(address, port), process)}
+
+
+def evaluate(listeners, rules):
+    """Problems for these listeners under these rules, plus required rules nobody fills."""
+    problems = []
+    for l in listeners:
+        proto, port, procs = l["proto"], l["port"], l["processes"]
+        near = [r for r in rules if r.covers(proto, port)]
+        if any(r.owns(procs) and LEVEL[l["exposure"]] <= LEVEL[r.scope] for r in near):
+            continue
+        who = names(procs)
+        owned = [r for r in near if r.owns(procs)]
+        if not near:
+            kind, msg = "unexpected", "no rule allows %s/%d" % (proto, port)
+        elif owned:
+            widest = max((r.scope for r in owned), key=LEVEL.get)
+            kind, msg = "exposure", "bound to %s (%s), allowed: %s" % (l["address"], l["exposure"], widest)
+        elif not procs:
+            kind, msg = "process", "owner unknown (run as root to see it), rule expects %s" % (
+                " or ".join(sorted({r.process if r.cmd is None else "%s cmd=%s" % (r.process, r.cmd)
+                                    for r in near})))
+        else:
+            kind, msg = "process", "%s/%d is allowed for %s, not %s" % (
+                proto, port, " or ".join(sorted({r.process for r in near})), who)
+        problems.append(problem(kind, proto, l["address"], port, who, msg, l["exposure"]))
+    for r in rules:
+        if r.required and not any(r.covers(l["proto"], l["port"]) and r.owns(l["processes"])
+                                  for l in listeners):
+            problems.append(problem("missing", r.proto, "*", 0, r.process,
+                                    "required but not listening: %s (line %d)" % (r.label(), r.line)))
+            problems[-1]["port"] = format_ranges(r.ports)
+            problems[-1]["key"] = "missing line %d %s" % (r.line, r.text)
+    return problems
+
+
+def status_of(listener, problems):
+    for p in problems:
+        if (p["proto"], p["address"], p["port"]) == (listener["proto"], listener["address"], listener["port"]):
+            return p
+    return None
+
+
+def diff(previous, problems):
+    current = {p["key"]: p for p in problems}
+    new = [p for k, p in current.items() if k not in previous]
+    resolved = [p for k, p in previous.items() if k not in current]
+    return new, resolved
+
+
+# ---------------------------------------------------------------------------------- allowlist
+HEADER = """\
+# port-sentinel allowlist, written by `port-sentinel init` on {host} at {time}.
+# Every line below is something that was listening when init ran, good or bad: review it,
+# delete what should not be there, and tighten scopes (public -> private -> loopback).
+#
+#   PROTO  PORTS        PROGRAM   OPTIONS
+#   tcp    22           sshd      required     required = alert when nothing listens there
+#   tcp    80,443       nginx                  public (the default): any address, 0.0.0.0 too
+#   tcp    6379         redis*    loopback     loopback / private = must not be bound wider
+#   tcp    3000-3010    node      cmd=*api*    cmd = glob on the full command line
+#   udp    *            chronyd   loopback     * = any port (or any program)
+"""
+
+
+def build_allowlist(listeners, host, ephemeral=(32768, 60999), root=True):
+    groups = {}
+    for l in listeners:
+        who = names(l["processes"]) if l["processes"] else "*"
+        if "," in who:
+            who = "*"  # several programs share the socket
+        scripts = {script_of(p) for p in l["processes"]}
+        script = scripts.pop() if len(scripts) == 1 and who != "*" else None
+        if script:
+            who = "%s cmd=%s" % (who, cmd_glob(script))
+        groups.setdefault((l["proto"], who, l["exposure"]), set()).add(l["port"])
+    lines = [HEADER.format(host=host, time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))]
+    if not root:
+        lines.append("# init did not run as root: programs of other users show as *\n")
+    lo, hi = ephemeral
+    body = []
+    for (proto, who, scope), ports in groups.items():
+        fixed = {p for p in ports if not (proto == "udp" and lo <= p <= hi)}
+        if fixed:
+            body.append((proto, min(fixed), format_ranges(compress(fixed)), who, scope, ""))
+        if fixed != ports:
+            body.append((proto, lo, "%d-%d" % (lo, hi), who, scope, "  # ephemeral ports: client sockets"))
+    body.sort(key=lambda b: (b[0], b[1], b[3]))
+    wide = [max([len(b[i]) for b in body] + [4]) for i in (2, 3)]
+    for proto, _, ports, who, scope, note in body:
+        opt = "" if scope == "public" else scope
+        lines.append(("%-6s %-*s  %-*s  %s" % (proto, wide[0], ports, wide[1], who, opt)).rstrip() + note)
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------------------------- output
+def paint(text, code, stream=None):
+    stream = stream or sys.stdout
+    if code and stream.isatty() and not os.environ.get("NO_COLOR"):
+        return "\033[%sm%s\033[0m" % (code, text)
+    return text
+
+
+KIND_COLOR = {"unexpected": "31", "exposure": "31", "process": "33", "missing": "31",
+              "reachable": "31", "unreachable": "33"}
+
+
+def table(rows, colors=None):
+    widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
+    out = []
+    for n, r in enumerate(rows):
+        cells = [str(c).ljust(widths[i]) for i, c in enumerate(r)]
+        code = colors[n] if colors else None
+        if code:
+            cells[-1] = paint(cells[-1], code)
+        out.append("  ".join(cells).rstrip())
+    return "\n".join(out)
+
+
+def pid_label(processes):
+    if not processes:
+        return "-"
+    return str(processes[0]["pid"]) + ("+%d" % (len(processes) - 1) if len(processes) > 1 else "")
+
+
+def problem_line(p):
+    where = "%s %s" % (p["proto"], endpoint(p["address"], p["port"]) if p["kind"] != "missing" else p["port"])
+    return "%-11s %-24s %-15s %s" % (p["kind"].upper(), where, p["process"], p["message"])
+
+
+def warn(msg):
+    print("port-sentinel: " + msg, file=sys.stderr)
+
+
+def log(msg):
+    print("%s %s" % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
+
+
+# ------------------------------------------------------------------------------ notifications
+def alert_text(host, new, resolved, active):
+    lines = []
+    if new:
+        lines.append("\U0001F6A8 port-sentinel on %s: %d new problem%s" % (host, len(new), "" if len(new) == 1 else "s"))
+        lines += ["+ " + problem_line(p).rstrip() for p in new]
+    if resolved:
+        lines.append("\u2705 port-sentinel on %s: %d resolved" % (host, len(resolved)))
+        lines += ["- " + problem_line(p).rstrip() for p in resolved]
+    lines.append("%d problem%s open" % (len(active), "" if len(active) == 1 else "s") if active else "all clear")
+    return "\n".join(lines)
+
+
+def payload(target, event):
+    """(url, body bytes, content type) for a notify target, shaped for the service behind it."""
+    parts = urllib.parse.urlsplit(target)
+    host = (parts.hostname or "").lower()
+    text = event["text"]
+    if host in ("discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"):
+        if len(text) > DISCORD_LIMIT - 8:
+            text = text[:DISCORD_LIMIT - 12] + "\n..."
+        body = {"username": "port-sentinel", "content": "```\n%s\n```" % text,
+                "allowed_mentions": {"parse": []}}
+    elif host == "hooks.slack.com":
+        body = {"text": "```\n%s\n```" % text}
+    elif host == "api.telegram.org":
+        query = urllib.parse.parse_qs(parts.query)
+        if "chat_id" not in query:
+            raise Error("telegram target needs ?chat_id=... in the URL")
+        target = urllib.parse.urlunsplit(parts._replace(query=""))
+        body = {"chat_id": query["chat_id"][0], "text": text, "disable_web_page_preview": True}
+    elif host == "ntfy.sh" or parts.path.startswith("/ntfy/"):
+        return target, text.encode("utf-8"), "text/plain; charset=utf-8"
+    else:
+        body = event
+    return target, json.dumps(body).encode("utf-8"), "application/json"
+
+
+def redact(target):
+    if target.startswith("exec:"):
+        return "exec:" + target[5:].split()[0] if target[5:].split() else target
+    parts = urllib.parse.urlsplit(target)
+    return "%s://%s/..." % (parts.scheme, parts.hostname)
+
+
+def send(target, event):
+    if target.startswith("exec:"):
+        res = subprocess.run(target[5:], shell=True, input=json.dumps(event).encode("utf-8"),
+                             stdout=subprocess.DEVNULL, timeout=60)
+        if res.returncode:
+            raise Error("exited with code %d" % res.returncode)
+        return
+    if not target.startswith(("http://", "https://")):
+        raise Error("not an http(s) URL or exec: command")
+    url, body, ctype = payload(target, event)
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": ctype, "User-Agent": "port-sentinel/" + __version__})
+    with urllib.request.urlopen(req, timeout=20) as res:
+        res.read()
+
+
+def notify_targets(args):
+    return list(args.notify or []) + os.environ.get(ENV_NOTIFY, "").split()
+
+
+def notify(targets, host, new, resolved, active):
+    """Send to every target. True when all of them took it (so the state can move on)."""
+    event = {"tool": "port-sentinel", "version": __version__, "host": host,
+             "time": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+             "new": new, "resolved": resolved, "active": active}
+    event["text"] = alert_text(host, new, resolved, active)
+    ok = True
+    for target in targets:
+        try:
+            send(target, event)
+        except Exception as e:  # one broken webhook must not hide the others
+            warn("notify %s failed: %s" % (redact(target), getattr(e, "reason", None) or e))
+            ok = False
+    return ok
+
+
+# -------------------------------------------------------------------------------------- state
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise Error("cannot read state %s: %s" % (path, e))
+    return {p["key"]: p for p in data.get("problems", [])}
+
+
+def save_state(path, problems):
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".port-sentinel-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "saved": int(time.time()), "problems": problems}, f, indent=1)
+    os.replace(tmp, path)
+
+
+def report(args, problems, host):
+    """Diff against the saved state, notify, save. Returns (new, resolved)."""
+    previous = load_state(args.state) if args.state else {}
+    new, resolved = diff(previous, problems)
+    targets = notify_targets(args)
+    if not args.state:
+        resolved = []  # nothing to compare with: every run reports what is open
+    sent = True
+    if targets and (new or resolved):
+        sent = notify(targets, host, new, resolved, problems)
+    if args.state and sent:
+        save_state(args.state, problems)
+    return new, resolved
+
+
+# ------------------------------------------------------------------------------------ commands
+def cmd_scan(args):
+    listeners = collect(args.proc)
+    path = find_allowlist(args.allow, must_exist=bool(args.allow))
+    problems = evaluate(listeners, load_rules(path)) if path else None
+    if args.json:
+        for l in listeners:
+            p = status_of(l, problems) if problems is not None else None
+            l["status"] = (p["kind"] if p else "ok") if problems is not None else None
+            l["message"] = p["message"] if p else None
+        out = {"host": args.name, "listeners": listeners}
+        if problems is not None:
+            out["missing"] = [p for p in problems if p["kind"] == "missing"]
+        print(json.dumps(out, indent=2))
+        return 0
+    if not listeners:
+        print("nothing is listening")
+        return 0
+    head = ["PROTO", "ADDRESS", "PORT", "EXPOSURE", "PID", "PROGRAM"]
+    rows, colors = [head + (["STATUS"] if problems is not None else [])], [None]
+    for l in listeners:
+        row = [l["proto"], l["address"], l["port"], l["exposure"], pid_label(l["processes"]), program(l["processes"])]
+        color = None
+        if problems is not None:
+            p = status_of(l, problems)
+            row.append("%s: %s" % (p["kind"].upper(), p["message"]) if p else "ok")
+            color = KIND_COLOR[p["kind"]] if p else "32"
+        rows.append(row)
+        colors.append(color)
+    print(table(rows, colors))
+    if problems is not None:
+        for p in problems:
+            if p["kind"] == "missing":
+                print(paint("MISSING: " + p["message"], "31"))
+    if not is_root() and any(not l["processes"] for l in listeners):
+        warn("not root: programs of other users show as ?")
+    return 0
+
+
+def cmd_init(args):
+    listeners = collect(args.proc)
+    path = args.allow or os.environ.get(ENV_ALLOW) or (DEFAULT_ALLOW if is_root() else LOCAL_ALLOW)
+    text = build_allowlist(listeners, args.name, ephemeral_range(args.proc), is_root())
+    if path == "-":
+        sys.stdout.write(text)
+        return 0
+    if os.path.exists(path) and not args.force:
+        raise Error("%s already exists (use --force to overwrite, or --allow - to print)" % path)
+    folder = os.path.dirname(os.path.abspath(path))
+    os.makedirs(folder, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print("wrote %s: %d listening socket%s. Review it, then run `port-sentinel check`."
+          % (path, len(listeners), "" if len(listeners) == 1 else "s"))
+    if not is_root():
+        warn("not root: programs of other users are unknown and were written as *")
+    return 0
+
+
+def check_problems(args, rules):
+    return evaluate(collect(args.proc), rules)
+
+
+def print_problems(args, problems, total, what="listening socket"):
+    if args.json:
+        print(json.dumps({"host": args.name, "problems": problems}, indent=2))
+        return
+    for p in problems:
+        print(paint(problem_line(p).rstrip(), KIND_COLOR.get(p["kind"])))
+    if problems:
+        print("%d problem%s" % (len(problems), "" if len(problems) == 1 else "s"))
+    elif not args.quiet:
+        print("ok: %d %s%s, all allowed" % (total, what, "" if total == 1 else "s"))
+
+
+def cmd_check(args):
+    rules = load_rules(find_allowlist(args.allow))
+    listeners = collect(args.proc)
+    problems = evaluate(listeners, rules)
+    print_problems(args, problems, len(listeners))
+    report(args, problems, args.name)
+    return 1 if problems else 0
+
+
+def cmd_watch(args):
+    path = find_allowlist(args.allow)
+    rules, stamp = load_rules(path), os.path.getmtime(path)
+    previous = load_state(args.state) if args.state else {}
+    targets = notify_targets(args)
+    log("watching every %gs with %s (%d rule%s), %d notify target%s" % (
+        args.interval, path, len(rules), "" if len(rules) == 1 else "s", len(targets), "" if len(targets) == 1 else "s"))
+    while True:
+        try:
+            if os.path.getmtime(path) != stamp:
+                stamp = os.path.getmtime(path)
+                rules = load_rules(path)
+                log("allowlist reloaded (%d rules)" % len(rules))
+        except (OSError, Error) as e:
+            log("allowlist not reloaded, keeping the previous rules: %s" % e)
+        problems = check_problems(args, rules)
+        new, resolved = diff(previous, problems)
+        if new or resolved:
+            for p in new:
+                log("+ " + problem_line(p).rstrip())
+            for p in resolved:
+                log("- " + problem_line(p).rstrip())
+            if not targets or notify(targets, args.name, new, resolved, problems):
+                previous = {p["key"]: p for p in problems}
+                if args.state:
+                    save_state(args.state, problems)
+        if args.once:
+            return 1 if problems else 0
+        time.sleep(args.interval)
+
+
+def resolve(host, family):
+    try:
+        infos = socket.getaddrinfo(host, None, family, socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise Error("cannot resolve %s: %s" % (host, e.strerror))
+    return infos[0][0], infos[0][4][0]
+
+
+def is_open(family, address, port, timeout):
+    s = socket.socket(family, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((address, port)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def scan_ports(family, address, ports, timeout, workers):
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        hits = pool.map(lambda p: (p, is_open(family, address, p, timeout)), ports)
+        return sorted(p for p, hit in hits if hit)
+
+
+def probe_problems(address, scanned, open_ports, rules, lan=False):
+    need = LEVEL["private"] if lan else LEVEL["public"]
+    tcp = [r for r in rules if r.proto in ("tcp", "any")]
+    problems = []
+    for port in open_ports:
+        if not any(r.covers("tcp", port) and LEVEL[r.scope] >= need for r in tcp):
+            near = [r for r in tcp if r.covers("tcp", port)]
+            msg = ("reachable, but allowed only as %s" % max((r.scope for r in near), key=LEVEL.get)
+                   if near else "reachable, and no rule allows tcp/%d" % port)
+            problems.append(problem("reachable", "tcp", address, port, "", msg))
+    scanned, opened = set(scanned), set(open_ports)
+    for r in tcp:
+        if not r.required or r.ports is None or LEVEL[r.scope] < need:
+            continue
+        mine = [p for p in scanned if r.covers("tcp", p)]
+        if mine and not opened.intersection(mine):
+            problems.append(problem("unreachable", "tcp", address, 0, "",
+                                    "required but closed from here: %s (line %d)" % (r.label(), r.line)))
+            problems[-1]["port"] = format_ranges(r.ports)
+            problems[-1]["key"] = "unreachable %s line %d %s" % (address, r.line, r.text)
+    return problems
+
+
+def cmd_probe(args):
+    try:
+        ranges = parse_ports(args.ports)
+    except ValueError as e:
+        raise Error("--ports: %s" % e)
+    ports = sorted({p for lo, hi in (ranges or ((1, 65535),)) for p in range(lo, hi + 1)})
+    path = find_allowlist(args.allow, must_exist=bool(args.allow))
+    rules = load_rules(path) if path else None
+    family, address = resolve(args.host, socket.AF_INET6 if args.ipv6 else socket.AF_INET)
+    if not args.quiet and not args.json:
+        print("probing %d tcp port%s on %s (%s)..." % (len(ports), "" if len(ports) == 1 else "s", args.host, address),
+              file=sys.stderr, flush=True)
+    started = time.time()
+    open_ports = scan_ports(family, address, ports, args.timeout, args.workers)
+    problems = probe_problems(address, ports, open_ports, rules, args.lan) if rules is not None else []
+    if args.json:
+        print(json.dumps({"host": args.host, "address": address, "open": open_ports, "problems": problems}, indent=2))
+    else:
+        print("open: %s" % (", ".join(map(str, open_ports)) or "none"))
+        if rules is not None:
+            print_problems(args, problems, len(open_ports), "open port")
+        if not args.quiet:
+            print("%d ports in %.1fs" % (len(ports), time.time() - started), file=sys.stderr)
+    if rules is not None:
+        report(args, problems, args.name or args.host)
+    return 1 if problems else 0
+
+
+# ----------------------------------------------------------------------------------------- cli
+def parser():
+    ap = argparse.ArgumentParser(
+        prog="port-sentinel",
+        description="Know every port your server listens on, and get told when that changes.",
+        epilog="exit codes: 0 ok, 1 problems found, 2 error. https://github.com/Zodiachz/port-sentinel")
+    ap.add_argument("--version", action="version", version="port-sentinel " + __version__)
+    sub = ap.add_subparsers(dest="command", metavar="COMMAND")
+
+    def common(p, local=True, alerts=True):
+        p.add_argument("--allow", metavar="FILE",
+                       help="allowlist (default: $%s, %s, ./%s)" % (ENV_ALLOW, DEFAULT_ALLOW, LOCAL_ALLOW))
+        p.add_argument("--json", action="store_true", help="machine-readable output")
+        p.add_argument("--name", default=socket.gethostname(), help="host name used in alerts")
+        if local:
+            p.add_argument("--proc", default="/proc", help=argparse.SUPPRESS)
+        if alerts:
+            p.add_argument("--notify", action="append", metavar="TARGET",
+                           help="webhook URL (Discord, Slack, Telegram, ntfy or any JSON endpoint) or "
+                                "exec:COMMAND; repeatable; also $%s" % ENV_NOTIFY)
+            p.add_argument("--state", metavar="FILE",
+                           help="remember problems between runs: alert only on new and resolved ones")
+            p.add_argument("-q", "--quiet", action="store_true", help="print nothing when all is well")
+
+    p = sub.add_parser("scan", help="list listening ports")
+    common(p, alerts=False)
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("init", help="write an allowlist from what listens right now")
+    common(p, alerts=False)
+    p.add_argument("--force", action="store_true", help="overwrite an existing allowlist")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("check", help="check once; exit 1 on any problem")
+    common(p)
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("watch", help="check in a loop, alert on changes")
+    common(p)
+    p.add_argument("--interval", type=float, default=60, metavar="SECONDS", help="default 60")
+    p.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("probe", help="TCP connect scan of a host you own, from outside")
+    p.add_argument("host")
+    common(p, local=False)
+    p.set_defaults(name=None)
+    p.add_argument("--ports", default="1-65535", help="ports to try, like 1-1024,8080 (default: all)")
+    p.add_argument("--timeout", type=float, default=1.0, metavar="SECONDS", help="per port, default 1")
+    p.add_argument("--workers", type=int, default=64,
+                   help="parallel connections, default 64 (home routers may block a faster scan)")
+    p.add_argument("--lan", action="store_true", help="probing from the same network: private rules count too")
+    p.add_argument("-6", dest="ipv6", action="store_true", help="use IPv6")
+    p.set_defaults(func=cmd_probe)
+    return ap
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    if not args.command:
+        parser().print_help()
+        return 2
+    try:
+        return args.func(args)
+    except Error as e:
+        warn(str(e))
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

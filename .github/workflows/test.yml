@@ -1,0 +1,55 @@
+name: test
+on: [push, pull_request]
+jobs:
+  unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.8", "3.12"]
+        exclude:
+          - os: macos-latest   # no 3.8 build for Apple silicon runners
+            python: "3.8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+
+  linux-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: scan the runner as root
+        run: sudo ./port-sentinel scan
+      - name: init, then check passes
+        run: |
+          sudo ./port-sentinel init --allow /tmp/allow.conf
+          cat /tmp/allow.conf
+          sudo ./port-sentinel check --allow /tmp/allow.conf --state /tmp/state.json
+      - name: a new listener makes check fail
+        run: |
+          python3 -m http.server 8765 --bind 0.0.0.0 >/dev/null 2>&1 &
+          sleep 1
+          set +e
+          sudo ./port-sentinel check --allow /tmp/allow.conf --state /tmp/state.json --notify "exec:cat > /tmp/alert.json"
+          code=$?
+          set -e
+          test "$code" = 1
+          grep -q 8765 /tmp/alert.json
+
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &
+          printf 'tcp 8765 * required\n' > /tmp/probe.conf
+          sleep 1
+      - uses: ./
+        with:
+          host: 127.0.0.1
+          ports: 8760-8770
+          allowlist: /tmp/probe.conf
